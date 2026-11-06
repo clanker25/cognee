@@ -1,0 +1,470 @@
+import difflib
+import os
+from collections import deque
+from typing import IO
+
+from rdflib import OWL, RDF, RDFS, Graph, URIRef
+from rdflib.util import guess_format
+
+from cognee.modules.ontology.base_ontology_resolver import BaseOntologyResolver
+from cognee.modules.ontology.exceptions import (
+    FindClosestMatchError,
+    GetSubgraphError,
+    OntologyInitializationError,
+    OntologyReasoningDependencyError,
+)
+from cognee.modules.ontology.matching_strategies import FuzzyMatchingStrategy, MatchingStrategy
+from cognee.modules.ontology.models import AttachedOntologyNode
+from cognee.modules.ontology.ontology_env_config import (
+    get_ontology_env_config,
+    normalize_ontology_reasoning,
+)
+from cognee.modules.ontology.rdf_xml.parse_rdf_content import (
+    FALLBACK_FORMATS,
+    parse_rdf_content,
+    parse_rdf_file,
+)
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger("OntologyAdapter")
+
+CONTENT_TYPE_FORMATS = {
+    "application/rdf+xml": "xml",
+    "application/xml": "xml",
+    "text/xml": "xml",
+    "text/turtle": "turtle",
+    "application/x-turtle": "turtle",
+    "text/n3": "n3",
+    "application/n-triples": "nt",
+    "application/n-quads": "nquads",
+    "application/trig": "trig",
+    "application/ld+json": "json-ld",
+}
+
+# Upload filename extension -> rdflib parser name. This table is the single
+# list of accepted upload extensions: the 400 message, the router docs and the
+# frontend picker (UploadOntologyModal.tsx ``accept``) all mirror it.
+EXTENSION_FORMATS = {
+    ".owl": "xml",
+    ".rdf": "xml",
+    ".xml": "xml",
+    ".ttl": "turtle",
+    ".n3": "n3",
+    ".jsonld": "json-ld",
+    ".nt": "nt",
+    ".nq": "nquads",
+    ".trig": "trig",
+}
+
+
+def normalize_content_type(content_type: str | None) -> str | None:
+    """Strip parameters (e.g. ``; charset=utf-8``) and lowercase a MIME type."""
+    if not content_type:
+        return None
+    return str(content_type).split(";", maxsplit=1)[0].strip().lower()
+
+
+def detect_rdf_format(filename: str | None, content_type: str | None) -> str | None:
+    """Return the rdflib parser name implied by ``filename`` or ``content_type``.
+
+    The extension wins when it is in ``EXTENSION_FORMATS`` (``.owl``, ``.ttl``, ...);
+    otherwise the MIME type decides (``text/turtle``, ``application/ld+json``, ...).
+    Returns ``None`` when neither identifies a supported RDF serialization.
+    """
+    if filename:
+        extension = os.path.splitext(str(filename))[1].lower()
+        if extension in EXTENSION_FORMATS:
+            return EXTENSION_FORMATS[extension]
+
+    normalized_content_type = normalize_content_type(content_type)
+    if normalized_content_type:
+        return CONTENT_TYPE_FORMATS.get(normalized_content_type)
+
+    return None
+
+
+def supported_rdf_extensions() -> list[str]:
+    """File extensions (with leading dot) accepted for ontology uploads."""
+    return list(EXTENSION_FORMATS)
+
+
+def supported_rdf_content_types() -> list[str]:
+    """MIME types accepted for ontology uploads whose filename has no known extension."""
+    return sorted(CONTENT_TYPE_FORMATS)
+
+
+# Predicates the OWL-RL closure asserts reflexively for every term it touches.
+REFLEXIVE_CLOSURE_PREDICATES = (
+    RDFS.subClassOf,
+    RDFS.subPropertyOf,
+    OWL.equivalentClass,
+    OWL.equivalentProperty,
+    OWL.sameAs,
+)
+
+
+class RDFLibOntologyResolver(BaseOntologyResolver):
+    """RDFLib-based ontology resolver implementation.
+
+    This implementation uses RDFLib to parse and work with RDF/OWL ontology files.
+    It provides fuzzy matching and subgraph extraction capabilities for ontology entities.
+
+    ``ontology_reasoning`` selects what the lookup and subgraph walk see: ``"none"``
+    (the asserted triples only) or ``"owl_rl"`` (the OWL 2 RL closure of the parsed
+    graph, so ``owl:inverseOf``, ``rdfs:domain``/``rdfs:range`` typing,
+    ``owl:equivalentClass``, ``owl:sameAs`` and transitive properties are honoured).
+    ``None`` falls back to the ONTOLOGY_REASONING environment value.
+    """
+
+    def __init__(
+        self,
+        ontology_file: str | list[str] | IO | list[IO] | None = None,
+        matching_strategy: MatchingStrategy | None = None,
+        ontology_reasoning: str | None = None,
+    ) -> None:
+        super().__init__(matching_strategy)
+        self.ontology_file = ontology_file
+        if ontology_reasoning is None:
+            ontology_reasoning = get_ontology_env_config().ontology_reasoning
+        self.ontology_reasoning = normalize_ontology_reasoning(ontology_reasoning)
+        try:
+            self.graph = None
+            if ontology_file is not None:
+                files_to_load = []
+                file_objects = []
+
+                if hasattr(ontology_file, "read"):
+                    file_objects = [ontology_file]
+                elif isinstance(ontology_file, str):
+                    files_to_load = [ontology_file]
+                elif isinstance(ontology_file, list):
+                    if all(hasattr(item, "read") for item in ontology_file):
+                        file_objects = ontology_file
+                    else:
+                        files_to_load = ontology_file
+                else:
+                    raise ValueError(
+                        f"ontology_file must be a string, list of strings, file-like object, list of file-like objects, or None. Got: {type(ontology_file)}"
+                    )
+
+                if file_objects:
+                    self.graph = Graph()
+                    loaded_objects = []
+                    for file_obj in file_objects:
+                        try:
+                            parsed_format = self._parse_file_object(file_obj, self.graph)
+                            loaded_objects.append(file_obj)
+                            logger.info(
+                                "Ontology loaded successfully from file object '%s' as %s",
+                                self._get_file_object_name(file_obj),
+                                parsed_format,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to parse ontology file object '%s': %s",
+                                self._get_file_object_name(file_obj),
+                                str(e),
+                                exc_info=True,
+                            )
+
+                    if not loaded_objects:
+                        raise ValueError(
+                            "No valid ontology file objects could be parsed. "
+                            "No owl ontology will be attached to the graph."
+                        )
+                    else:
+                        logger.info("Total ontology file objects loaded: %d", len(loaded_objects))
+
+                elif files_to_load:
+                    self.graph = Graph()
+                    loaded_files = []
+                    for file_path in files_to_load:
+                        if os.path.exists(file_path):
+                            parse_rdf_file(self.graph, file_path)
+                            loaded_files.append(file_path)
+                            logger.info("Ontology loaded successfully from file: %s", file_path)
+                        else:
+                            logger.warning(
+                                "Ontology file '%s' not found. Skipping this file.",
+                                file_path,
+                            )
+
+                    if not loaded_files:
+                        logger.info(
+                            "No valid ontology files found. No owl ontology will be attached to the graph."
+                        )
+                        self.graph = None
+                    else:
+                        logger.info("Total ontology files loaded: %d", len(loaded_files))
+                else:
+                    logger.info(
+                        "No ontology file provided. No owl ontology will be attached to the graph."
+                    )
+            else:
+                logger.info(
+                    "No ontology file provided. No owl ontology will be attached to the graph."
+                )
+                self.graph = None
+
+            self._apply_reasoning()
+            self.build_lookup()
+        except OntologyReasoningDependencyError:
+            # A missing optional dependency is a configuration problem, not a parse
+            # failure: surface it as-is so the fix (install the extra) is visible.
+            raise
+        except Exception as e:
+            logger.exception("Failed to load ontology")
+            raise OntologyInitializationError(f"Failed to load ontology: {e}") from e
+
+    def _apply_reasoning(self) -> None:
+        """Expand the parsed graph with its OWL 2 RL closure when reasoning is enabled.
+
+        Runs between parsing and ``build_lookup`` so the inferred triples take part in
+        class/individual lookup and in ``get_subgraph``. The closure is materialised
+        in place; its cost grows with ontology size, which is why it is opt-in.
+        """
+        if self.ontology_reasoning != "owl_rl" or self.graph is None:
+            return
+
+        try:
+            import owlrl
+        except ImportError as e:
+            raise OntologyReasoningDependencyError() from e
+
+        triples_before = len(self.graph)
+        owlrl.DeductiveClosure(owlrl.OWLRL_Semantics).expand(self.graph)
+        self._prune_closure_tautologies()
+        logger.info(
+            "OWL-RL reasoning expanded the ontology from %d to %d triples",
+            triples_before,
+            len(self.graph),
+        )
+
+    def _prune_closure_tautologies(self) -> None:
+        """Drop the closure's bookkeeping triples that carry no domain knowledge.
+
+        OWL-RL's schema rules make every class/property reflexive (``A subClassOf A``,
+        ``A sameAs A``) and declare ``owl:Thing``/``owl:Nothing`` as classes above
+        everything. Left in, they turn into ``is_a`` self-loops in ``get_subgraph`` and
+        let a fuzzy match ground an entity type to ``owl:Thing``.
+        """
+        for predicate in REFLEXIVE_CLOSURE_PREDICATES:
+            for subject, _, obj in list(self.graph.triples((None, predicate, None))):
+                if subject == obj:
+                    self.graph.remove((subject, predicate, obj))
+        for top_term in (OWL.Thing, OWL.Nothing):
+            self.graph.remove((top_term, None, None))
+            self.graph.remove((None, None, top_term))
+
+    def _uri_to_key(self, uri: URIRef) -> str:
+        uri_str = str(uri)
+        if "#" in uri_str:
+            name = uri_str.split("#")[-1]
+        else:
+            name = uri_str.rstrip("/").split("/")[-1]
+        return name.lower().replace(" ", "_").strip()
+
+    def _get_file_object_name(self, file_obj: IO) -> str:
+        return str(
+            getattr(file_obj, "filename", None)
+            or getattr(file_obj, "name", None)
+            or file_obj.__class__.__name__
+        )
+
+    def _get_content_type_format(self, file_obj: IO) -> str | None:
+        content_type = normalize_content_type(getattr(file_obj, "content_type", None))
+        if not content_type:
+            return None
+
+        return CONTENT_TYPE_FORMATS.get(content_type)
+
+    def _get_candidate_formats(self, file_obj: IO) -> list[str]:
+        formats = []
+
+        # A stored upload (``OntologyFile``) carries the format detected at upload
+        # time; it is tried before anything re-derived from the name or MIME type.
+        stored_format = getattr(file_obj, "rdf_format", None)
+        if stored_format:
+            formats.append(stored_format)
+
+        filename = getattr(file_obj, "filename", None) or getattr(file_obj, "name", None)
+        if filename:
+            guessed_format = guess_format(str(filename))
+            if guessed_format:
+                formats.append(guessed_format)
+
+        content_type_format = self._get_content_type_format(file_obj)
+        if content_type_format:
+            formats.append(content_type_format)
+
+        formats.extend(FALLBACK_FORMATS)
+        return list(dict.fromkeys(formats))
+
+    def _parse_file_object(self, file_obj: IO, target_graph: Graph) -> str:
+        try:
+            file_obj.seek(0)
+        except (AttributeError, OSError):
+            pass
+
+        content = file_obj.read()
+        if not isinstance(content, (str, bytes)):
+            raise TypeError(
+                f"Ontology file object returned unsupported content type: {type(content)}"
+            )
+
+        try:
+            parsed_graph, rdf_format = parse_rdf_content(
+                content, self._get_candidate_formats(file_obj)
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"Unable to parse ontology file object '{self._get_file_object_name(file_obj)}'. "
+                f"{error}"
+            ) from error
+
+        for prefix, namespace in parsed_graph.namespaces():
+            target_graph.bind(prefix, namespace, override=False)
+
+        for triple in parsed_graph:
+            target_graph.add(triple)
+
+        return rdf_format
+
+    def build_lookup(self) -> None:
+        try:
+            classes: dict[str, URIRef] = {}
+            individuals: dict[str, URIRef] = {}
+
+            if not self.graph:
+                self.lookup: dict[str, dict[str, URIRef]] = {
+                    "classes": classes,
+                    "individuals": individuals,
+                }
+
+                return
+
+            for cls in self.graph.subjects(RDF.type, OWL.Class):
+                key = self._uri_to_key(cls)
+                classes[key] = cls
+
+            for subj, _, obj in self.graph.triples((None, RDF.type, None)):
+                if obj in classes.values():
+                    key = self._uri_to_key(subj)
+                    individuals[key] = subj
+
+            self.lookup = {
+                "classes": classes,
+                "individuals": individuals,
+            }
+            logger.info(
+                "Lookup built: %d classes, %d individuals",
+                len(classes),
+                len(individuals),
+            )
+
+            return
+        except Exception as e:
+            logger.error("Failed to build lookup dictionary: %s", str(e))
+            raise RuntimeError("Lookup build failed") from e
+
+    def refresh_lookup(self) -> None:
+        self.build_lookup()
+        logger.info("Ontology lookup refreshed.")
+
+    def find_closest_match(self, name: str, category: str) -> str | None:
+        try:
+            normalized_name = name.lower().replace(" ", "_").strip()
+            possible_matches = list(self.lookup.get(category, {}).keys())
+
+            return self.matching_strategy.find_match(normalized_name, possible_matches)
+        except Exception as e:
+            logger.error("Error in find_closest_match: %s", str(e))
+            raise FindClosestMatchError() from e
+
+    def _get_category(self, uri: URIRef) -> str:
+        if uri in self.lookup.get("classes", {}).values():
+            return "classes"
+        if uri in self.lookup.get("individuals", {}).values():
+            return "individuals"
+        return "unknown"
+
+    def get_subgraph(
+        self, node_name: str, node_type: str = "individuals", directed: bool = True
+    ) -> tuple[list[AttachedOntologyNode], list[tuple[str, str, str]], AttachedOntologyNode | None]:
+        nodes_set = set()
+        edges: list[tuple[str, str, str]] = []
+        visited = set()
+        queue = deque()
+
+        try:
+            closest_match = self.find_closest_match(name=node_name, category=node_type)
+            if not closest_match:
+                logger.info("No close match found for '%s' in category '%s'", node_name, node_type)
+                return [], [], None
+
+            node = self.lookup[node_type].get(closest_match)
+            if node is None:
+                logger.info("Node '%s' not found in lookup.", closest_match)
+                return [], [], None
+
+            logger.info("%s match was found for found for '%s' node", node, node_name)
+
+            queue.append(node)
+            visited.add(node)
+            nodes_set.add(node)
+
+            obj_props = set(self.graph.subjects(RDF.type, OWL.ObjectProperty))
+
+            while queue:
+                current = queue.popleft()
+                current_label = self._uri_to_key(current)
+
+                if node_type == "individuals":
+                    for parent in self.graph.objects(current, RDF.type):
+                        parent_label = self._uri_to_key(parent)
+                        edges.append((current_label, "is_a", parent_label))
+                        if parent not in visited:
+                            visited.add(parent)
+                            queue.append(parent)
+                        nodes_set.add(parent)
+
+                for parent in self.graph.objects(current, RDFS.subClassOf):
+                    parent_label = self._uri_to_key(parent)
+                    edges.append((current_label, "is_a", parent_label))
+                    if parent not in visited:
+                        visited.add(parent)
+                        queue.append(parent)
+                    nodes_set.add(parent)
+
+                for prop in obj_props:
+                    prop_label = self._uri_to_key(prop)
+                    for target in self.graph.objects(current, prop):
+                        target_label = self._uri_to_key(target)
+                        edges.append((current_label, prop_label, target_label))
+                        if target not in visited:
+                            visited.add(target)
+                            queue.append(target)
+                        nodes_set.add(target)
+                    if not directed:
+                        for source in self.graph.subjects(prop, current):
+                            source_label = self._uri_to_key(source)
+                            edges.append((source_label, prop_label, current_label))
+                            if source not in visited:
+                                visited.add(source)
+                                queue.append(source)
+                            nodes_set.add(source)
+
+            rdf_nodes = [
+                AttachedOntologyNode(uri=uri, category=self._get_category(uri))
+                for uri in list(nodes_set)
+            ]
+            rdf_root = (
+                AttachedOntologyNode(uri=node, category=self._get_category(node))
+                if node is not None
+                else None
+            )
+
+            return rdf_nodes, edges, rdf_root
+        except Exception as e:
+            logger.error("Error in get_subgraph: %s", str(e))
+            raise GetSubgraphError() from e
