@@ -1,0 +1,203 @@
+"use client";
+
+import React, { useState } from "react";
+import { useRouter } from "next/navigation";
+import { trackEvent } from "@/modules/analytics";
+import { isAgentIntegrationKey } from "@/modules/agents/getAgentConnections";
+import type { AgentIntegrationKey } from "@/modules/agents/getAgentConnections";
+import Modal from "@/ui/elements/Modal/Modal";
+import { OsToggle } from "@/ui/elements/OsToggle";
+import { useOsPreference } from "@/ui/layout/OsPreferenceContext";
+import { CARDS_CFG, getSteps } from "./agentConnectionSteps";
+import type { AciAgentKey } from "./agentConnectionSteps";
+import { AciCard } from "./AciCard";
+import { AciStepRow } from "./AciStepRow";
+
+interface AgentConnectionSectionProps {
+  onUploadClick: () => void;
+  /** Opens AgentSetupModal for a plugin agent (claude-code/codex) — the same
+   *  modal a click on its Integrations card or its memory-graph node opens,
+   *  so all three surfaces make the same choice between the connected
+   *  summary and the install wizard. This section's own inline popup below
+   *  is now only ever reached by openclaw/api-mcp, which have no such
+   *  connected-summary split. */
+  onOpenAgentSetup: (agent: AgentIntegrationKey) => void;
+  isUploading: boolean;
+  serviceUrl: string | null;
+  apiKey: string | null;
+  isInitializing: boolean;
+  hasDocuments: boolean;
+  integrationConnected?: Record<string, boolean>;
+  lastSeenByAgent?: Partial<Record<string, string>>;
+  /** Plugin agents with a running session right now — see AciCard. */
+  runningAgents?: ReadonlySet<string>;
+  /** Telemetry's first poll hasn't answered yet — see AciCard. */
+  connectionsLoading?: boolean;
+}
+
+export function AgentConnectionSection({
+  onUploadClick,
+  onOpenAgentSetup,
+  isUploading,
+  serviceUrl,
+  apiKey,
+  isInitializing,
+  hasDocuments,
+  integrationConnected = {},
+  lastSeenByAgent = {},
+  runningAgents,
+  connectionsLoading = false,
+}: AgentConnectionSectionProps): React.ReactElement {
+  const router = useRouter();
+  const { os } = useOsPreference();
+  const [activeKey, setActiveKey] = useState<AciAgentKey | null>(null);
+  const [stepIndexMap, setStepIndexMap] = useState<Partial<Record<AciAgentKey, number>>>({});
+  const baseUrl = serviceUrl ?? "https://your-tenant.aws.cognee.ai";
+  const resolvedKey = apiKey ?? "your-api-key";
+  // `!apiKey` belongs in the gate as much as `isInitializing` does: provisioning
+  // releases the spinner before the key lands (useTenantInit.ts:256), so a new
+  // user sits at isInitializing === false with no key for a minute or two. The
+  // Claude Code / Codex steps write ~/.cognee/.env, where copying the
+  // "your-api-key" placeholder would replace a working key rather than set a
+  // throwaway shell variable.
+  const stepOpts = { baseUrl, resolvedKey, isInitializing: isInitializing || !apiKey, os };
+
+  function handleCardClick(key: AciAgentKey) {
+    trackEvent({ pageName: "Dashboard", eventName: "agent_card_clicked", additionalProperties: { card: key } });
+    if (key === "upload") { onUploadClick(); return; }
+    // claude-code/codex open AgentSetupModal instead of this section's own
+    // popup below: that popup baselines whatever registration already exists
+    // as "not new" and has no connected-summary view, so a card that already
+    // reads "Connected" reopened the install steps and showed "Waiting for
+    // Claude Code to start…" for an agent that had been running for hours.
+    if (isAgentIntegrationKey(key)) { onOpenAgentSetup(key); return; }
+    setActiveKey(key);
+    if (stepIndexMap[key] === undefined) {
+      setStepIndexMap((s) => ({ ...s, [key]: 0 }));
+    }
+  }
+
+  function goToStep(key: AciAgentKey, idx: number) {
+    trackEvent({ pageName: "Dashboard", eventName: "agent_step_viewed", additionalProperties: { card: key, step: String(idx) } });
+    setStepIndexMap((prev) => ({ ...prev, [key]: idx }));
+  }
+
+  const popupOpen = activeKey !== null && activeKey !== "upload";
+  const activeCfg = CARDS_CFG.find((c) => c.key === activeKey);
+  const activeSteps = activeKey ? getSteps(activeKey, stepOpts) : [];
+  const currentStep = activeKey ? (stepIndexMap[activeKey] ?? 0) : 0;
+
+  // claude-code/codex never reach this popup (handleCardClick routes them to
+  // AgentSetupModal instead), so the only logo this needs is openclaw's —
+  // api-mcp renders its own inline svg in the header below.
+  const logoSrc = "/visuals/logos/openclaw.svg";
+
+  const popupContent =
+    popupOpen && activeCfg && activeKey ? (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="aci-popup-title"
+        onClick={(e) => e.stopPropagation()}
+        className="aci-popup"
+        style={{
+          background: "rgba(15,15,15,0.92)",
+          borderRadius: 0,
+          width: 520,
+          maxWidth: "calc(100vw - 32px)",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.1)",
+          overflow: "hidden",
+          // no backdropFilter here: combined with a transform animation + fill-mode
+          // forwards it pins this layer on a stale sub-pixel raster until an unrelated repaint
+          animation: "aci-popup 200ms cubic-bezier(0.22,1,0.36,1) forwards",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "16px 20px", borderBottom: "1px solid rgba(255,255,255,0.1)" }}>
+          {activeKey === "api-mcp" ? (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
+              <rect x="3" y="6" width="18" height="12" rx="2" stroke="rgba(237,236,234,0.7)" strokeWidth="1.5" />
+              <path d="M7 9L4 12L7 15" stroke="var(--color-cognee-lavender-tint-60)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M17 9L20 12L17 15" stroke="var(--color-cognee-lavender-tint-60)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <line x1="13" y1="8" x2="11" y2="16" stroke="rgba(237,236,234,0.5)" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          ) : (
+            <img src={logoSrc} alt={activeCfg.name} style={{ width: 24, height: 24, objectFit: "contain", flexShrink: 0 }} />
+          )}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div id="aci-popup-title" style={{ fontSize: 15, fontWeight: 700, color: "#EDECEA", lineHeight: "20px" }}>Connect {activeCfg.name}</div>
+            <div style={{ fontSize: 12, color: "rgba(237,236,234,0.45)", marginTop: 1 }}>Step {currentStep + 1} of {activeSteps.length}</div>
+          </div>
+          <button
+            onClick={() => setActiveKey(null)}
+            aria-label="Close"
+            style={{ background: "none", border: "none", color: "rgba(237,236,234,0.65)", cursor: "pointer", padding: 4, borderRadius: 0, lineHeight: 1, flexShrink: 0 }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", padding: "12px 20px 0" }}>
+          <OsToggle />
+        </div>
+        {activeSteps.map((step, i) => (
+          <AciStepRow
+            key={i}
+            step={step}
+            index={i}
+            total={activeSteps.length}
+            isActive={currentStep === i}
+            isDone={i < currentStep}
+            card={activeKey}
+            onClick={() => goToStep(activeKey, i)}
+            onNavigate={(path) => router.push(path)}
+          />
+        ))}
+      </div>
+    ) : null;
+
+  return (
+    <div>
+      <style>{`
+        @keyframes aci-check  { 0% { transform: scale(0.4); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+        @keyframes aci-spin   { to { transform: rotate(360deg); } }
+        @keyframes aci-popup  { 0% { opacity: 0; transform: scale(0.97) translateY(6px); } 100% { opacity: 1; transform: scale(1) translateY(0); } }
+        .aci-card-logo { transition: transform 300ms ease; }
+        .aci-card:hover { border-color: rgba(188,155,255,0.35) !important; }
+        .aci-card:hover .aci-card-logo { transform: scale(1.12); }
+        .aci-card:hover .aci-cta-chip { background: #BC9BFF !important; border-color: #BC9BFF !important; color: #14141C !important; }
+        .aci-step-row:hover { background: rgba(255,255,255,0.04); }
+        .aci-step-row[data-active="true"]:hover { background: transparent; }
+        /* Fixed-width cards in a horizontally scrollable row — cards keep their
+           content-based width and scroll rather than compressing on narrow screens. */
+        .aci-card-row { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+        .aci-card-row::-webkit-scrollbar { display: none; }
+        @media (prefers-reduced-motion: reduce) {
+          .aci-card-logo, .aci-step-body, .aci-popup { transition: none !important; animation: none !important; }
+        }
+      `}</style>
+
+      <div className="aci-card-row">
+        {CARDS_CFG.map((card) => (
+          <AciCard
+            key={card.key}
+            card={card}
+            activeKey={activeKey}
+            isUploading={isUploading}
+            hasDocuments={hasDocuments}
+            integrationConnected={integrationConnected}
+            lastSeenByAgent={lastSeenByAgent}
+            runningAgents={runningAgents}
+            loading={connectionsLoading}
+            onCardClick={handleCardClick}
+          />
+        ))}
+      </div>
+
+      <Modal isOpen={popupOpen} onClose={() => setActiveKey(null)}>
+        {popupContent}
+      </Modal>
+    </div>
+  );
+}

@@ -1,0 +1,168 @@
+from uuid import UUID
+
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+from pydantic import ConfigDict, Field
+
+from cognee import __version__ as cognee_version
+from cognee.api.DTO import ErrorResponse, InDTO
+from cognee.exceptions import CogneeApiError
+from cognee.modules.users.methods import get_authenticated_user
+from cognee.modules.users.models import User
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.usage_logger import log_usage
+from cognee.shared.utils import send_telemetry
+
+
+class ForgetPayloadDTO(InDTO):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"dataset": "main_dataset", "memoryOnly": True}]},
+    )
+
+    data_id: UUID | None = Field(
+        default=None,
+        examples=[""],
+        description="UUID of a single data item to remove. "
+        "Requires `dataset` or `datasetId` to also be set.",
+    )
+    dataset: str | None = Field(
+        default=None,
+        examples=["default_dataset"],
+        description="Dataset name to delete (or clear with memoryOnly). "
+        "Provide either `dataset` or `datasetId`, not both.",
+    )
+    dataset_id: UUID | None = Field(
+        default=None,
+        examples=[""],
+        description="Dataset UUID, alternative to `dataset`. "
+        "Provide either `dataset` or `datasetId`, not both.",
+    )
+    everything: bool = Field(
+        default=False,
+        description="DANGER: when true, permanently deletes every dataset the user may "
+        "delete (relational records, graph, vector embeddings) and every session the "
+        "user owns or that belongs to one of those datasets. Other users' sessions "
+        "stay. Ignores dataId/dataset/datasetId.",
+    )
+    memory_only: bool = Field(
+        default=False,
+        description="When True with a dataset, delete only memory (graph nodes/edges and vector embeddings) "
+        "and reset pipeline status — raw files and data records are preserved. "
+        "This allows re-cognifying the dataset from scratch.",
+    )
+    clean_history: bool = Field(
+        default=False,
+        description="When true, also delete the caller's own search and recall history "
+        "(the rows GET /v1/search and GET /v1/recall list), in every dataset, before the "
+        "data is deleted. Dataset and everything forgets purge the deleted datasets' "
+        "history regardless of this flag.",
+    )
+
+
+def get_forget_router() -> APIRouter:
+    router = APIRouter()
+
+    @router.post(
+        "",
+        summary="Forget data: one item, a dataset, its memory only, or everything",
+        response_model=dict,
+        responses={
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
+        },
+    )
+    @log_usage(function_name="POST /v1/forget", log_type="api_endpoint")
+    async def forget_endpoint(
+        payload: ForgetPayloadDTO, user: User = Depends(get_authenticated_user)
+    ):
+        """Remove data from the knowledge graph.
+
+        - Set `everything: true` to delete all user data.
+        - Set `dataset` or `datasetId` alone to delete an entire dataset.
+        - Set `dataset`/`datasetId` + `dataId` to delete a single item.
+        - Set `dataset`/`datasetId` + `memoryOnly: true` to clear memory
+          (graph + vector), preserving raw files so the dataset can be re-cognified.
+        - Set `dataset`/`datasetId` + `dataId` + `memoryOnly: true` to clear memory
+          for a single file only.
+        - Set `cleanHistory: true` alone to delete only your own search and recall
+          history, or with any target to delete it along with the data.
+
+        ## Request Parameters
+        - **dataId** (Optional[UUID]): UUID of a single data item to remove. Requires
+          `dataset` or `datasetId` to also be set.
+        - **dataset** (Optional[str]): Name of the dataset to delete or clear.
+        - **datasetId** (Optional[UUID]): UUID of the dataset, alternative to `dataset`.
+        - **everything** (bool): When true, permanently deletes every dataset the user
+          may delete, and every session the user owns or that belongs to one of those
+          datasets (default: false).
+        - **memoryOnly** (bool): When true, delete only memory (graph + vector embeddings),
+          preserving raw files and data records (default: false).
+        - **cleanHistory** (bool): When true, also delete the caller's own search and
+          recall history before the data is deleted (default: false). Forgetting a dataset
+          or everything purges that data's history regardless.
+
+        Provide either `dataset` or `datasetId`, not both. Field names are shown camelCased
+        in the schema; snake_case aliases (`data_id`, `dataset_id`, `memory_only`, `clean_history`) are also
+        accepted.
+
+        ## Response
+        A snake_case JSON object whose keys depend on the target (this route answers a
+        union of shapes, so it is not bound to one response model). For a `dataId` delete
+        it is the deletion receipt — the fields of `DeleteDataReceiptDTO` in snake_case
+        (`status`, `dataset_id`, `data_id`, `data_record_found`, `deleted_nodes`,
+        `deleted_edges`, `data_remaining`, `dataset_deleted`); `status` is `"success"`,
+        or `"not_found"` when nothing existed for the id. The two dataset-data DELETE
+        routes return the same receipt camelCased.
+
+        ## Error Codes
+        - **404 Not Found**: Dataset name does not exist or is not accessible
+        - **403 Forbidden**: Caller lacks delete permission on the dataset
+        - **422 Unprocessable Entity**: Invalid parameter combination (e.g. both `dataset`
+          and `datasetId`, `dataId` without a dataset, or `memoryOnly` without a dataset)
+        - **500 Internal Server Error**: Error during deletion
+        """
+        send_telemetry(
+            "Forget API Endpoint Invoked",
+            user,
+            additional_properties={
+                "endpoint": "POST /v1/forget",
+                "cognee_version": cognee_version,
+            },
+        )
+
+        from cognee.api.v1.forget import forget
+
+        try:
+            result = await forget(
+                data_id=payload.data_id,
+                dataset=payload.dataset,
+                dataset_id=payload.dataset_id,
+                everything=payload.everything,
+                memory_only=payload.memory_only,
+                clean_history=payload.clean_history,
+                user=user,
+            )
+            return result
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Invalid request parameters. Specify dataset or dataset_id, data_id+dataset, everything=True, or clean_history=True."
+                },
+            )
+        except CogneeApiError:
+            # Typed errors carry their own status code (DatasetNotFoundError -> 404,
+            # PermissionDeniedError -> 403) and are rendered by the global
+            # CogneeApiError handler; swallowing them here used to turn both into 500s.
+            raise
+        except Exception:
+            logger = get_logger()
+            logger.exception("Forget endpoint error")
+            return JSONResponse(
+                status_code=500,
+                content={"error": "An error occurred during deletion."},
+            )
+
+    return router
